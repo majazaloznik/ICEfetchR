@@ -1,0 +1,19 @@
+Package: ICEfetchR
+Type: Package
+Title: What the Package Does (Title Case)
+Version: 0.1.0
+Authors@R: person(
+    "Maja", "Zaloznik",
+    role = c("aut", "cre"),
+    email = "maja.zaloznik@gmail.com",
+    comment = NULL
+  )
+Description: of the fetchR family of packages. 
+    Internal UMAR package for parsing dataseries from ICE and importing them into the platform database and calculating derived series.
+License: GPL (>= 3)
+Encoding: UTF-8
+LazyData: true
+Suggests: 
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
+Config/roxygen2/version: 8.1.0
