@@ -1,0 +1,353 @@
+---
+title: "ICEfetchR: design, decisions and open issues"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{ICEfetchR: design, decisions and open issues}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(eval = FALSE, collapse = TRUE)
+```
+
+ICEfetchR imports ICE futures settlement prices into the UMAR platform database
+and derives position series (M01, M02, ...) from them. It currently covers one
+product, ICE Low Sulphur Gasoil futures. Adding another product means adding a
+row to `ice_products()` (and an expiry rule if it differs).
+
+This document records how the package works and **why** it works that way.
+Items marked *(unverified)* are working assumptions that have not been
+confirmed against ICE documentation.
+
+# 1. Data flow
+
+```
+ICE API ──► GASOIL_RAW (one series per contract)   ICE_import_structure()
+                │                                   ICE_import_data_points()
+                ▼                                   UMARimportR::vintage_cleanup()
+            GASOIL_POS (M01..M24, derived)          ICE_import_pos_structure()
+                │                                   ICE_import_positions()
+                ▼                                   UMARimportR::vintage_cleanup()
+            views.mat_latest_data_points            REFRESH MATERIALIZED VIEW
+```
+
+Both raw and derived series are stored as first-class platform series
+(principle: *raw data is stored for transparency; heavily used derived data is
+stored too, not computed in a view*). The derived series are recomputed from
+the **stored** raw data, never from the in-memory scrape, so they are fully
+reproducible from the database.
+
+# 2. The ICE API
+
+Base URL: `https://www.ice.com/marketdata/api/productguide/charting/`
+
+| endpoint | used for | notes |
+|---|---|---|
+| `contract-data?productId=5817&hubId=9373&mode=2` | list of contracts (`marketId`, `marketStrip`) | `lastPrice` is the **intraday last trade**, not the settlement, and is deliberately ignored. `endDate` is the end of the *delivery month*, not the last trading day. |
+| `data/historical?marketId=<id>&historicalSpan=3` | daily price history per contract | `bars` = `[date string, price]`. No volume. Today's bar only appears once the day is complete. |
+| `data/current-day?marketId=<id>` | (not used) | intraday minute bars |
+
+Quirks discovered during development:
+
+* **The contract list varies from day to day.** We have seen 23, 28 and 30
+  contracts on different days; far-dated, illiquid contracts drop out and
+  reappear. Consequences: absence from the list must **not** be read as
+  expiry, and a contract missing on a given day is simply updated on the next
+  day it is listed (the full history is fetched each time).
+* **History is (probably) a rolling ~2-year window** *(unverified)*. Every
+  contract's history started on 2024-10-01, including recently listed ones.
+  This is why each new vintage merges stored and fetched data (section 5).
+  Other `historicalSpan` values have not been explored; a larger span could
+  allow a longer one-off backfill.
+* **Rate limiting.** Two quick full runs (~60 requests) triggered HTTP 429 with
+  `Retry-After: 3600`. httr2's default retry then waited silently for an hour.
+  `ice_request()` therefore:
+    * throttles to 1 request per second (`req_throttle(rate = 1)`; the actual
+      ICE limit is unknown),
+    * treats 429 as **non**-transient, so it fails immediately,
+    * retries only 500/502/503/504, for at most 60 seconds.
+* **Request economy.** On days without new data, `prepare_ice_data()` probes
+  only the 2nd and 3rd nearest contracts (all contracts share one trading
+  calendar). The front contract is not used as a probe because an
+  expired-but-still-listed contract would always look "not new". A no-news day
+  therefore costs 3 requests instead of ~31.
+* **Weekday/month parsing is locale-independent.** Bar dates such as
+  `"Tue Oct 01 00:00:00 2024"` and strips such as `"Dec26"` are parsed via
+  `month.abb`, never `%b`, because the production machines use a Slovenian
+  locale.
+* Prices look like settlement prices (they differ from `lastPrice`, and
+  illiquid contracts have a price every day, as settlements do), but this is
+  *(unverified)*. Only 1–3% of days are unchanged, across all maturities, so
+  far contracts are not stale carry-forwards.
+
+**Terms of use** for automated access to ice.com have not been checked.
+
+# 3. Codes and database structure
+
+| item | value | why |
+|---|---|---|
+| source | `ICE` (also for derived series) | the derived series are a mechanical remapping of ICE prices, like a rolling mean |
+| tables | `GASOIL_RAW`, `GASOIL_POS` | table codes must be unique |
+| raw series code | `ICE--GASOIL_RAW--202610--D` | contract as **YYYYMM** so that plain text sorting is chronological (MMYY would put `0127` before `1026`); the ICE strip (`Oct26`) is kept as `level_text` source and in messages |
+| derived series code | `ICE-UMAR--GASOIL_POS--M01--D` | single hyphen in the first segment = derived by UMAR (`source.name` can never contain a hyphen, so this is unambiguous); positions zero-padded for sorting |
+| non-time dimension | `contract` (raw) / `position` (derived), plus time dimension `date` | |
+| dimension levels | `202610` / "October 2026"; `M01` / "Position 1 (front month)" | labels built with `month.name`, locale-independent |
+| category | ICE root category, `id = 0`, for both tables | |
+| unit | `usd/t` | |
+| interval / period_id | `D`, ISO `YYYY-MM-DD` | business days only; gaps are handled downstream |
+| `keep_vintage` | `TRUE` | unchanged history is removed by hash cleanup anyway; a revised settlement keeps the older vintage as evidence |
+| `table.notes` (POS) | JSON with `derived_from`, method, expiry rule, `n_positions` | the only place where lineage of the derived table is recorded |
+
+Product configuration lives in `ice_products()`: table code, ICE product and
+hub ids, name, unit, URL, `expiry_rule`, `derived_code`, `n_positions`.
+
+# 4. Structure import
+
+`ICE_import_structure()` and `ICE_import_pos_structure()` are **idempotent**:
+every insert is `ON CONFLICT DO NOTHING`. They run before every data import, so
+newly listed contracts are registered automatically. A second run should
+report 0 new rows everywhere.
+
+`ice_get_contracts()` is called once in the runner and passed to both raw
+functions via `contracts =`.
+
+# 5. Raw data import: vintage logic
+
+For each listed contract `prepare_series_update()`:
+
+1. fetches the ICE history;
+2. skips the contract if ICE has no history yet, and fails if ICE returns
+   future dates;
+3. reads the stored history of the latest vintage;
+4. **skips** the contract unless ICE's last date is newer than the stored one
+   (so repeated runs on the same day do nothing);
+5. builds the new vintage as `merge_history(stored, fetched)`:
+    * dates only in the database are kept (protects history beyond ICE's
+      rolling window),
+    * new dates are added,
+    * where both exist, ICE wins, and changed values are counted and reported
+      as revisions;
+6. sets `published` to the **last data date** at UTC midnight (not the run
+   time). Verified to be stored as `YYYY-MM-DD 00:00:00`.
+
+Vintage and data inserts run inside **one transaction**
+(`DBI::dbWithTransaction`). Without it, a failed data insert would leave an
+empty vintage as the latest one; the next run would then see "nothing stored"
+and replace the full history with ICE's 2-year window.
+
+`UMARimportR::vintage_cleanup()` then deletes the previous vintage when the
+new vintage's `partial_hash` (all values except the last) equals the old
+`full_hash`. This holds whenever exactly one new day was added. After a missed
+day (two new points) the old vintage is kept, which is harmless.
+
+Why not "read, append today's price, write back"? Because the history
+endpoint returns the full history, so missed runs fill themselves in and no
+state has to be carried between runs.
+
+# 6. Derived positions
+
+## Method
+
+Positions are **calendar-based**, not ranked:
+
+* `front(d)` = the earliest contract month whose last trading day is on or
+  after date `d`;
+* `Mk(d)` = `front(d)` + (k − 1) months;
+* value = the raw price of that contract on `d`, if it is stored.
+
+Ranking the available contracts on each date would be wrong for history: the
+raw table only contains contracts that were still listed when tracking began
+(Oct26 onwards), so on 2024-10-02 the nearest stored contract (Oct26) was in
+fact the 25th, not the front month.
+
+`compute_positions()` maps every raw `(contract, date)` row to exactly one
+position, with no loops and no per-date ranking.
+
+## Expiry rule
+
+`ice_expiry("GASOIL_RAW", contract_month)` = **two business days before the
+14th calendar day of the delivery month**, skipping weekends only
+*(rule from memory of the ICE contract specification; unverified; UK holidays
+not handled)*. Examples: Oct26 → 2026-10-12, Nov26 → 2026-11-12 (the 14th is a
+Saturday), Dec26 → 2026-12-10.
+
+Safeguards:
+
+* `compute_positions()` **fails loudly** if any raw contract has data after its
+  rule-based expiry (e.g. a holiday the rule ignores pushed the real expiry
+  later than computed).
+* Not detectable: a holiday that makes the real expiry *earlier* than the rule.
+  M01 would then be missing on that day.
+
+The first real test is Oct26 on 2026-10-12: its last bar should carry that
+date, and M01 should switch to Nov26 on 2026-10-13.
+
+## Properties to be aware of
+
+* **Triangular history.** M24 goes back to Oct 2024; M01 only starts on
+  2026-09-11 (the day after Sep26 expired). From now on all positions fill
+  completely.
+* **Gaps at far positions** (M20–M24 at first) when far contracts were missing
+  from the contract list on the days of import. They fill automatically once
+  the contracts are listed again, because positions are recomputed in full.
+  Backfilled history in the middle of a series only lands in `GASOIL_POS` on
+  the next trading day (a new vintage is written only when a position has a
+  newer last date).
+* **Roll jumps.** On the day after an expiry each position switches to the
+  next contract and drops (in backwardation) by the spread between adjacent
+  contracts. The jumps are of the same size as ordinary daily moves, so they
+  are invisible in charts but distort daily changes, returns and volatility.
+  Day-on-day changes across roll dates are not price moves.
+* **Terminology.** These are *nth-nearby* (Bloomberg: *generic*) series. They
+  are **not** constant-maturity series in the strict sense (which interpolate
+  to a fixed horizon and have no roll jumps). Calendar-based positions equal
+  nth-nearby as long as monthly contracts are listed without gaps, which is
+  true out to roughly 27 months.
+
+## Import
+
+`prepare_pos_data()` reads the full stored raw history
+(`read_raw_history()`), recomputes all positions, and writes a new vintage only
+for positions whose last date is newer than the stored one, with `published`
+set to that position's **own** last date. No merge is needed: raw history only
+grows. Insertion uses the same single transaction as the raw import.
+
+# 7. Volumes
+
+Not imported. The history endpoint has no volume, and `contract-data`'s
+`volume` field is a snapshot of unclear meaning (e.g. Jan28 showed volume 801
+with no last trade time) with no history. Options if needed later: log daily
+`contract-data` snapshots for a couple of weeks to learn the semantics, or use
+ICE Report Center end-of-day reports (access not checked).
+
+# 8. Runner and scheduling
+
+`ice-update-database.R` (network share, `R/`), started daily by a batch file
+via Windows Task Scheduler; the log is overwritten and committed to git each
+run.
+
+```{r}
+contracts <- ICEfetchR::ice_get_contracts()
+ICEfetchR::ICE_import_structure("GASOIL_RAW", con = con, contracts = contracts)
+raw_res <- ICEfetchR::ICE_import_data_points("GASOIL_RAW", con = con, contracts = contracts)
+if (!is.null(raw_res)) {
+  UMARimportR::vintage_cleanup(con, table_id = table_id("GASOIL_RAW"), schema = "platform")
+  ICEfetchR::ICE_import_pos_structure("GASOIL_RAW", con = con)
+  pos_res <- ICEfetchR::ICE_import_positions("GASOIL_RAW", con = con)
+  if (!is.null(pos_res))
+    UMARimportR::vintage_cleanup(con, table_id = table_id("GASOIL_POS"), schema = "platform")
+}
+# staleness check, then REFRESH MATERIALIZED VIEW only if something was inserted
+```
+
+* Cleanup, positions and the view refresh are skipped when nothing new was
+  imported.
+* **Staleness check**: the run fails if the latest stored raw date is more than
+  6 calendar days old (covers weekends and holidays). Without it, an ICE
+  outage or silent API change would produce "no new data" forever without any
+  alert.
+* **Email only on failure** (daily job), to the maintainer, via the shared
+  `send_status_email()` pattern; table ids are looked up by code, never
+  hard-coded.
+* If the positions step fails after raw data went in, positions catch up on
+  the next day with new raw data (full recompute), so at most about one trading
+  day of lag.
+
+# 9. Testing
+
+* **Offline unit tests**: fetch parsing via
+  `testthat::local_mocked_bindings(ice_request = ...)` with canned JSON passed
+  through `jsonlite::fromJSON()`; `ice_request()` itself via
+  `httr2::local_mocked_responses()` (URL, user agent, 429 fails at once);
+  `merge_history()`, positions and expiry logic are pure functions.
+* **dittodb fixtures** (`tests/testthat/testdata/dittodb_recording_fixtures`):
+  recorded against the test database using three fixed contracts
+  (`test_contracts`) and deterministic `mock_history_*()` stand-ins for ICE.
+  The structure umbrella is recorded **twice**, so fixtures replay the
+  "already exists" state (all counts 0). Recording and tests must use
+  identical arguments (the query hash includes parameter values).
+* **Umbrella functions** are tested with mocked UMARimportR and
+  `DBI::dbWithTransaction` (checks: skip when nothing is new; vintages before
+  data, inside one transaction), so no test writes fake prices to the test
+  database.
+* A live smoke test (`test-fetch-live.R`) is skipped on CI.
+* Coverage: 95.85%. Remaining gaps are one-off branches (creating the ICE
+  source row) and error messages.
+
+# 10. Known limitations elsewhere in the platform
+
+Daily data is new to the platform. Not yet adapted:
+
+* `UMARaccessR::add_date_from_period_id()` / `add_last_date_from_period_id()`
+  return `NA` for interval `D`.
+* `UMARvisualisR::get_interval()` classifies `"2026-10-01"` as `"A"` (dates
+  parse correctly by accident); `determine_interval()` returns `NA` for daily
+  data, so growth/rolling transforms in `build_data.R` will likely fail.
+* `views.mat_latest_data_points`: the `date`, `year` and `month` columns are
+  `NULL` for daily data. A fix (one ISO branch, computing `date` once via
+  `CROSS JOIN LATERAL`) is drafted but deferred because the view has five
+  dependent views with grants. Daily users can use `period_id` directly.
+* UMARaccessR "not found" conventions are inconsistent
+  (`sql_get_table_id_from_table_code()` returns `NA`,
+  `sql_get_source_code_from_source_name()` returns `NULL`); ICEfetchR handles
+  both via `id_missing()`.
+* Shelved idea: `start_date` / `end_date` columns on `platform.period`, filled
+  at insert time, to replace the period-parsing code spread across packages.
+
+# 11. TODO
+
+## The `live` flag (before or soon after 2026-10-12)
+
+`series.live` stays `TRUE` for expired contracts. Plan:
+
+1. **UMARimportR**: new SQL function plus R wrapper, following the existing
+   `insert_new_*` pattern:
+
+```sql
+CREATE OR REPLACE FUNCTION platform.update_series_live(p_series_id bigint,
+                                                      p_live boolean,
+                                                      OUT count integer)
+AS $$
+BEGIN
+    UPDATE platform.series
+       SET live = p_live
+     WHERE id = p_series_id
+       AND live IS DISTINCT FROM p_live;
+    GET DIAGNOSTICS count = ROW_COUNT;
+END;
+$$ LANGUAGE plpgsql;
+```
+
+```{r}
+update_series_live <- function(con, df, schema = "platform") {
+  sql_function_call(con, "update_series_live",
+                    list(p_series_id = df$series_id, p_live = df$live), schema)
+}
+```
+
+2. **ICEfetchR**: `prepare_live_table(table_code, con, schema)` returning
+   `series_id`, `live` for all raw series, with
+   `live = Sys.Date() <= ice_expiry(table_code, code_to_month(contract_code))`.
+   Decide from the **date rule**, never from absence in the contract list
+   (which varies day to day). Position series are always live.
+3. **Runner**: call it after `ICE_import_structure()`; it only changes rows
+   whose status actually changes, so it is safe daily.
+4. Tests: pure test of the rule; dittodb test for the prepare function.
+
+## Checks
+
+* 2026-10-12: Oct26's last bar is dated 2026-10-12 and M01 rolls to Nov26 on
+  2026-10-13. If ICE publishes later bars, the run fails with "after
+  rule-based expiry", which means the expiry rule needs fixing.
+* Verify the expiry rule against the ICE contract specification, including UK
+  holidays.
+* Confirm the rolling history window (does `min(period_id)` move forward?) and
+  try larger `historicalSpan` values for a longer backfill.
+* Check ice.com terms of use for automated access.
+
+## Later
+
+* Daily (`D`) support in UMARaccessR and UMARvisualisR (section 10).
+* `mat_latest_data_points` ISO date branch.
+* Volume, if needed (section 7).
