@@ -17,3 +17,20 @@ test_contracts <- data.frame(
   contract_month = as.Date(c("2026-10-01", "2026-12-01", "2029-12-01")),
   contract_code = c("202610", "202612", "202912")
 )
+
+# Deterministic stand-ins for ice_get_history(); the recording and the tests must use the same ones
+mock_history_new <- function(market_id, span = 3) {
+  data.frame(period_id = c("2026-09-30", "2026-10-01", "2026-10-02"),
+             value = c(1300, 1310, 1320))
+}
+mock_history_old <- function(market_id, span = 3) {
+  data.frame(period_id = c("2026-09-30", "2026-10-01"), value = c(1300, 1310))
+}
+
+raw_fixture <- data.frame(
+  contract_code = rep(c("202610", "202611", "202612"), c(2, 3, 3)),
+  period_id     = c("2026-10-09", "2026-10-12",
+                    "2026-10-09", "2026-10-12", "2026-10-13",
+                    "2026-10-09", "2026-10-12", "2026-10-13"),
+  value         = c(100, 101, 90, 91, 92, 80, NA, 82)
+)

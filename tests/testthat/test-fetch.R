@@ -89,3 +89,28 @@ test_that("ice_get_history fails loudly on bad dates and duplicates", {
   mock_ice('{"marketId":1,"bars":[["Tue Sep 29 00:00:00 2026",1.0],["Tue Sep 29 00:00:00 2026",2.0]]}')
   expect_error(ice_get_history(1), "Duplicate dates")
 })
+
+# ---- ice_request (mocked HTTP) -------------------------------------------------
+
+test_that("ice_request builds URL, query and user agent, and parses JSON", {
+  seen <- NULL
+  httr2::local_mocked_responses(function(req) {
+    seen <<- req
+    httr2::response_json(body = list(a = 1))
+  })
+  out <- ice_request("data/historical", marketId = 1, historicalSpan = 3)
+  expect_equal(out$a, 1)
+  expect_match(seen$url, "/charting/data/historical\\?marketId=1&historicalSpan=3$")
+  expect_match(seen$options$useragent, "Mozilla")
+})
+
+test_that("ice_request fails at once on 429 instead of waiting", {
+  calls <- 0
+  httr2::local_mocked_responses(function(req) {
+    calls <<- calls + 1
+    httr2::response(status_code = 429)
+  })
+  expect_error(ice_request("contract-data"), class = "httr2_http_429")
+  expect_equal(calls, 1)
+})
+

@@ -20,13 +20,7 @@ test_that("code_to_month parses codes and fails loudly on bad ones", {
   expect_error(code_to_month(c("202610", "202613")), "Unparseable contract code\\(s\\): 202613")
 })
 
-raw_fixture <- data.frame(
-  contract_code = rep(c("202610", "202611", "202612"), c(2, 3, 3)),
-  period_id     = c("2026-10-09", "2026-10-12",
-                    "2026-10-09", "2026-10-12", "2026-10-13",
-                    "2026-10-09", "2026-10-12", "2026-10-13"),
-  value         = c(100, 101, 90, 91, 92, 80, NA, 82)
-)
+
 
 test_that("compute_positions maps contracts to positions and rolls correctly", {
   out <- compute_positions(raw_fixture, "GASOIL_RAW", n_positions = 2)
@@ -47,4 +41,60 @@ test_that("compute_positions fails loudly on data after expiry", {
   bad <- rbind(raw_fixture,
                data.frame(contract_code = "202610", period_id = "2026-10-13", value = 99))
   expect_error(compute_positions(bad, "GASOIL_RAW", 2), "after rule-based expiry for: 202610")
+})
+
+# ---- position structure and data (dittodb) -------------------------------------
+
+test_that("pos helpers", {
+  expect_equal(pos_codes(3), c("M01", "M02", "M03"))
+  expect_equal(pos_labels(2), c("Position 1 (front month)", "Position 2"))
+})
+
+test_that("read_raw_history returns contract codes and numeric values", {
+  with_mock_db({
+    con <- make_test_connection()
+    raw <- read_raw_history("GASOIL_RAW", con)
+    expect_named(raw, c("contract_code", "period_id", "value"))
+    expect_true(all(grepl("^\\d{6}$", raw$contract_code)))
+    expect_type(raw$value, "double")
+  })
+})
+
+test_that("prepare_pos_* build the derived table, levels and series", {
+  with_mock_db({
+    con <- make_test_connection()
+    tt <- prepare_pos_table_table("GASOIL_RAW", con)
+    expect_equal(tt$code, "GASOIL_POS")
+    expect_equal(jsonlite::fromJSON(tt$notes)$derived_from, "GASOIL_RAW")
+
+    dl <- prepare_pos_dimension_levels_table("GASOIL_RAW", con)
+    expect_equal(dl$level_value, pos_codes(24))
+    expect_length(unique(dl$tab_dim_id), 1)
+
+    s <- prepare_pos_series_table("GASOIL_RAW", con)
+    expect_equal(s$code[1], "ICE-UMAR--GASOIL_POS--M01--D")
+    expect_equal(nrow(s), 24)
+  })
+})
+
+test_that("GASOIL_POS has exactly one non-time dimension, 'position', and levels use it", {
+  with_mock_db({
+    con <- make_test_connection()
+    dims <- UMARaccessR::sql_get_non_time_dimensions_from_table_id(
+      get_ice_table_id("GASOIL_POS", con), con)
+    expect_equal(dims$dimension, "position")
+    expect_equal(unique(prepare_pos_dimension_levels_table("GASOIL_RAW", con)$tab_dim_id),
+                 dims$id)
+  })
+})
+
+test_that("ICE_import_pos_structure is idempotent and ICE_import_positions is up to date", {
+  with_mock_db({
+    con <- make_test_connection()
+    res <- suppressMessages(ICE_import_pos_structure(con = con))
+    counts <- purrr::map_dbl(res, \(r) sum(r$count))
+    expect_equal(counts, stats::setNames(rep(0, length(counts)), names(counts)))
+    expect_message(out <- ICE_import_positions(con = con), "no new data")
+    expect_null(out)
+  })
 })
