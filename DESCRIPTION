@@ -1,7 +1,7 @@
 Package: ICEfetchR
 Type: Package
 Title: What the Package Does (Title Case)
-Version: 0.1.0
+Version: 1.0.0
 Authors@R: person(
     "Maja", "Zaloznik",
     role = c("aut", "cre"),
@@ -14,6 +14,19 @@ License: GPL (>= 3)
 Encoding: UTF-8
 LazyData: true
 Suggests: 
-    testthat (>= 3.0.0)
+    testthat (>= 3.0.0),
+    dittodb
+Imports: 
+    DBI, 
+    httr2, 
+    jsonlite, 
+    purrr, 
+    UMARaccessR, 
+    UMARimportR,
+    withr,
+    RPostgres
 Config/testthat/edition: 3
 Config/roxygen2/version: 8.1.0
+Remotes: 
+    majazaloznik/UMARaccessR, 
+    majazaloznik/UMARimportR
